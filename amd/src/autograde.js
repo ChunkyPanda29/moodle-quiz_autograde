@@ -46,7 +46,7 @@ class AutoGrade {
     async runGrading() {
         try {
             const response = await Ajax.call([{
-                methodname: 'quiz_autograde_run_autograde',
+                methodname: 'quiz_autograde_run',
                 args: {
                     quizID: this.quizID,
                     courseID: this.courseID,

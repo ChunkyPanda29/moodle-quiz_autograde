@@ -26,7 +26,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $functions = [
-    'quiz_autograde_run_autograde' => [
+    'quiz_autograde_run' => [
         'classname'   => 'quiz_autograde\external\run_autograde',
         'description' => 'Grades essay answers grouped by question using AI (provider-agnostic).',
         'type'        => 'write',
