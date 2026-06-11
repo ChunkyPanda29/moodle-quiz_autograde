@@ -54,9 +54,12 @@ class run_autograde extends external_api {
     /**
      * Grade essay questions of a quiz attempt using an AI service.
      *
+     * Continues processing on individual failures and returns a summary
+     * of graded and failed questions.
+     *
      * @param int $quizid The ID of the quiz
      * @param int $courseid The ID of the course
-     * @return string The result
+     * @return string The result summary (JSON with graded, failed, details)
      */
     public static function execute($quizid, $courseid) {
         $params = self::validate_parameters(
@@ -73,6 +76,9 @@ class run_autograde extends external_api {
         $essayattempts = quiz_autograde_get_essay_attempts($quizid);
 
         $questionsgraded = 0;
+        $questionsfailed = 0;
+        $questionsskipped = 0;
+        $failuredetails = [];
 
         foreach ($essayattempts as $attempt) {
             $attempt = (object) $attempt;
@@ -82,23 +88,52 @@ class run_autograde extends external_api {
 
             // Skip if already graded or no grader info.
             if ($alreadygraded || $nograderinfo) {
+                $questionsskipped++;
                 continue;
             }
 
             if (strlen($attempt->answer) == 0) {
                 // No answer provided, set grade to 0.
-                quiz_autograde_set_grade($attempt, 0, 'No answer provided.');
+                quiz_autograde_set_grade($attempt, 0, get_string('noanswer', 'quiz_autograde'));
+                $questionsgraded++;
             } else {
-                // Grade by LLM.
-                $data = quiz_autograde_generate_grade($attempt, $context->id);
-                $grade = max(0, min($attempt->maxmark, $data->grade));
-                $comment = $data->comment ?? 'No explanation provided.';
-                quiz_autograde_set_grade($attempt, $grade, $comment);
+                // Grade by LLM (with retry support).
+                $result = quiz_autograde_generate_grade($attempt, $context->id);
+
+                if ($result->success) {
+                    $grade = max(0, min($attempt->maxmark, $result->grade));
+                    $comment = $result->comment;
+                    quiz_autograde_set_grade($attempt, $grade, $comment);
+                    $questionsgraded++;
+                } else {
+                    // Don't throw — record the failure and continue.
+                    $questionsfailed++;
+                    $failuredetails[] = [
+                        'student' => $attempt->student,
+                        'question' => $attempt->questionname,
+                        'error' => $result->error,
+                    ];
+                }
             }
 
-            $questionsgraded++;
+            // Throttle between API calls to reduce rate limit pressure.
+            if (QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS > 0) {
+                sleep(QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS);
+            }
         }
 
-        return get_string('numberofquestionsgraded', 'quiz_autograde', $questionsgraded);
+        // Build a JSON result for the frontend to parse.
+        $result = [
+            'graded' => $questionsgraded,
+            'failed' => $questionsfailed,
+            'skipped' => $questionsskipped,
+            'total' => count($essayattempts),
+        ];
+
+        if ($questionsfailed > 0) {
+            $result['failures'] = $failuredetails;
+        }
+
+        return json_encode($result);
     }
 }

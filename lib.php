@@ -209,17 +209,30 @@ function quiz_autograde_require_text_generation() {
 }
 
 /**
- * Generates a grade for an essay attempt using an AI service.
+ * Default number of retry attempts per question when AI grading fails.
+ */
+define('QUIZ_AUTOGRADE_DEFAULT_RETRIES', 2);
+
+/**
+ * Default delay in seconds between API calls to avoid rate limiting.
+ * Set to 0 for no delay, or a positive number for seconds between calls.
+ */
+define('QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS', 2);
+
+/**
+ * Generates a grade for an essay attempt using an AI service, with retry support.
  *
  * @param object $attempt The essay attempt object containing necessary information for grading.
  * @param int $contextid The ID of the context.
+ * @param int $maxretries Maximum number of retry attempts on failure (default: QUIZ_AUTOGRADE_DEFAULT_RETRIES).
  *
- * @return object An object containing the generated grade and comment.
- *
- * @throws Exception If there is an error during the AI grading process, if the response cannot be parsed or
- * if no grade is generated.
+ * @return object An object containing:
+ *               - success (bool): Whether grading succeeded
+ *               - grade (float|null): The grade (null on failure)
+ *               - comment (string|null): The comment (null on failure)
+ *               - error (string|null): Error message on failure
  */
-function quiz_autograde_generate_grade($attempt, $contextid) {
+function quiz_autograde_generate_grade($attempt, $contextid, $maxretries = QUIZ_AUTOGRADE_DEFAULT_RETRIES) {
     global $USER;
 
     $prompt = <<<EOD
@@ -252,26 +265,74 @@ function quiz_autograde_generate_grade($attempt, $contextid) {
     Only return valid JSON in the specified format, without any additional text. Make sure the JSON is properly formatted.
     EOD;
 
-    $action = new \core_ai\aiactions\generate_text($contextid, $USER->id, $prompt);
-    $manager = \core\di::get(\core_ai\manager::class);
-    $response = $manager->process_action($action);
+    $lasterror = '';
 
-    if (!$response->get_success()) {
-        $errorcode = $response->get_errorcode();
-        $error = $response->get_errormessage();
-        throw new \Exception("Error {$errorcode}: {$error}");
+    for ($retry = 0; $retry <= $maxretries; $retry++) {
+        // If retrying, add a short delay to let rate limits reset.
+        if ($retry > 0) {
+            $delay = QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS * $retry;
+            sleep($delay);
+        }
+
+        try {
+            $action = new \core_ai\aiactions\generate_text($contextid, $USER->id, $prompt);
+            $manager = \core\di::get(\core_ai\manager::class);
+            $response = $manager->process_action($action);
+
+            if (!$response->get_success()) {
+                $errorcode = $response->get_errorcode();
+                $error = $response->get_errormessage();
+                $lasterror = "Error {$errorcode}: {$error}";
+
+                // If rate limited (429), retry — the provider may have failed over to a new key.
+                // If auth error (401/403), retry — same reason.
+                // For other errors, don't retry.
+                if (!in_array($errorcode, [429, 401, 403, 500, 503])) {
+                    return (object) [
+                        'success' => false,
+                        'grade' => null,
+                        'comment' => null,
+                        'error' => $lasterror,
+                    ];
+                }
+                continue; // Retry.
+            }
+
+            $generatedcontent = $response->get_response_data()['generatedcontent'];
+
+            // Parse result.
+            $data = json_decode($generatedcontent);
+
+            if ($data === null || !isset($data->grade) || !is_numeric($data->grade)) {
+                // Invalid JSON response — don't retry, it's a prompt/model issue.
+                return (object) [
+                    'success' => false,
+                    'grade' => null,
+                    'comment' => null,
+                    'error' => get_string('invalidresponse', 'quiz_autograde', $generatedcontent),
+                ];
+            }
+
+            return (object) [
+                'success' => true,
+                'grade' => $data->grade,
+                'comment' => $data->comment ?? get_string('noexplanation', 'quiz_autograde'),
+                'error' => null,
+            ];
+
+        } catch (\Exception $e) {
+            $lasterror = $e->getMessage();
+            continue; // Retry on exception.
+        }
     }
 
-    $generatedcontent = $response->get_response_data()['generatedcontent'];
-
-    // Parse result.
-    $data = json_decode($generatedcontent);
-
-    if ($data === null || !isset($data->grade) || !is_numeric($data->grade)) {
-        throw new \Exception(get_string('invalidresponse', 'quiz_autograde', $generatedcontent));
-    }
-
-    return $data;
+    // All retries exhausted.
+    return (object) [
+        'success' => false,
+        'grade' => null,
+        'comment' => null,
+        'error' => get_string('retryexhausted', 'quiz_autograde', $lasterror),
+    ];
 }
 
 /**

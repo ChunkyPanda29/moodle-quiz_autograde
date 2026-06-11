@@ -41,7 +41,8 @@ class AutoGrade {
 
                 autogradeButton.setAttribute('disabled', 'disabled');
                 const oldText = autogradeButton.innerHTML;
-                autogradeButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
+                autogradeButton.innerHTML = '<i class="fa fa-spinner fa-spin"></i> ' +
+                    M.util.get_string('gradinginprogress', 'quiz_autograde');
 
                 const request = {
                     methodname: 'quiz_autograde_run',
@@ -56,7 +57,7 @@ class AutoGrade {
                     if (responseObj.error) {
                         this.showMessage(responseObj.error.exception.message, true);
                     } else {
-                        this.showMessage(responseObj, false);
+                        this.handleGradingResult(responseObj);
                     }
                 } catch (error) {
                     this.showMessage(error.message, true);
@@ -68,12 +69,69 @@ class AutoGrade {
         }
     }
 
+    /**
+     * Handle the JSON grading result, showing graded/failed/skipped breakdown.
+     *
+     * @param {string} responseText The JSON string from the server.
+     */
+    handleGradingResult(responseText) {
+        let result;
+        try {
+            result = JSON.parse(responseText);
+        } catch (e) {
+            // Fallback: if it's not JSON, display as plain text (backward compat).
+            this.showMessage(responseText, false);
+            return;
+        }
+
+        const hasFailures = result.failed > 0;
+        const parts = [];
+
+        parts.push(M.util.get_string('questionsgraded', 'quiz_autograde', result.graded));
+
+        if (result.skipped > 0) {
+            parts.push(M.util.get_string('questionsskipped', 'quiz_autograde', result.skipped));
+        }
+
+        if (hasFailures) {
+            parts.push(M.util.get_string('questionsfailed', 'quiz_autograde', result.failed));
+
+            // Build failure details table.
+            if (result.failures && result.failures.length > 0) {
+                let failureHtml = '<ul class="mt-2 mb-0" style="font-size: 0.9em;">';
+                for (const fail of result.failures) {
+                    failureHtml += `<li><strong>${this.escapeHtml(fail.student)}</strong>
+                        — ${this.escapeHtml(fail.question)}:
+                        <em>${this.escapeHtml(fail.error)}</em></li>`;
+                }
+                failureHtml += '</ul>';
+                parts.push(failureHtml);
+            }
+        }
+
+        const message = parts.join('<br>');
+        this.showMessage(message, hasFailures);
+    }
+
+    /**
+     * Escape HTML special characters to prevent XSS.
+     *
+     * @param {string} text The text to escape.
+     * @return {string} The escaped text.
+     */
+    escapeHtml(text) {
+        if (!text) return '';
+        const div = document.createElement('div');
+        div.appendChild(document.createTextNode(text));
+        return div.innerHTML;
+    }
+
     showMessage(message, error) {
         const resultField = document.querySelector(Selectors.ELEMENTS.AUTOGRADERESULT);
         if (resultField) {
             resultField.innerHTML = message;
             resultField.style.display = 'block';
-            resultField.classList.add(error ? 'alert-danger' : 'alert-info');
+            resultField.classList.add(error ? 'alert-danger' : 'alert-success');
         }
     }
 
@@ -82,7 +140,7 @@ class AutoGrade {
         if (resultField) {
             resultField.innerHTML = '';
             resultField.style.display = 'none';
-            resultField.classList.remove('alert-info', 'alert-danger');
+            resultField.classList.remove('alert-info', 'alert-success', 'alert-danger');
         }
     }
 }
