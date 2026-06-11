@@ -74,14 +74,23 @@ class AutoGrade {
         const hasFailures = (result.failed || 0) > 0;
         const parts = [];
 
-        parts.push(M.util.get_string('questionsgraded', 'quiz_autograde', result.graded || 0));
+        const graded = result.graded || 0;
+        const failed = result.failed || 0;
+        const skipped = result.skipped || 0;
+        const questions = result.questions || 0;
 
-        if (result.questions) {
-            parts.push(`Processed across ${result.questions} question(s)`);
+        parts.push(`<strong>${graded}</strong> question(s) graded successfully.`);
+
+        if (questions) {
+            parts.push(`Processed across <strong>${questions}</strong> question(s).`);
+        }
+
+        if (skipped > 0) {
+            parts.push(`${skipped} skipped (already graded or no grading info).`);
         }
 
         if (hasFailures) {
-            parts.push(M.util.get_string('questionsfailed', 'quiz_autograde', result.failed));
+            parts.push(`<strong>${failed}</strong> question(s) failed (see details below).`);
 
             if (result.failures && result.failures.length > 0) {
                 let failureHtml = '<ul class="mt-2 mb-0" style="font-size: 0.9em;">';
