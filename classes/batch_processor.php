@@ -188,11 +188,12 @@ EOD;
         }
 
         $requestbody = [
-            'model' => 'models/' . $this->model,
-            'displayName' => "quiz_autograde_quiz{$quizid}_" . date('Ymd_His'),
-            'inputConfig' => [
-                'requests' => [
-                    'requests' => $wrappedrequests,
+            'batch' => [
+                'displayName' => "quiz_autograde_quiz{$quizid}_" . date('Ymd_His'),
+                'inputConfig' => [
+                    'requests' => [
+                        'requests' => $wrappedrequests,
+                    ],
                 ],
             ],
         ];
