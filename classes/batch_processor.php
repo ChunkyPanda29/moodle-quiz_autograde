@@ -33,11 +33,11 @@ defined('MOODLE_INTERNAL') || die();
  */
 class batch_processor {
 
-    /** @var string Gemini API key (first available from aiprovider_gemini) */
+    /** @var string Primary Gemini API key from aiprovider_gemini */
     private string $apikey;
 
-    /** @var array All available API keys for failover */
-    private array $apikeys;
+    /** @var string Fallback API key (used on auth errors only) */
+    private string $apikeyfallback;
 
     /** @var string Gemini model to use */
     private string $model;
@@ -49,25 +49,8 @@ class batch_processor {
      * Constructor. Reads config from aiprovider_gemini.
      */
     public function __construct() {
-        // Read multi-key config from aiprovider_gemini.
-        $apikeysraw = get_config('aiprovider_gemini', 'apikeys');
-        if (!empty($apikeysraw)) {
-            $keys = array_filter(
-                array_map('trim', explode("\n", $apikeysraw)),
-                fn($key) => !empty($key)
-            );
-            $this->apikeys = array_values($keys);
-        }
-
-        // Fallback to legacy single key.
-        if (empty($this->apikeys)) {
-            $legacykey = get_config('aiprovider_gemini', 'apikey');
-            if (!empty($legacykey)) {
-                $this->apikeys = [$legacykey];
-            }
-        }
-
-        $this->apikey = $this->apikeys[0] ?? '';
+        $this->apikey = get_config('aiprovider_gemini', 'apikey') ?? '';
+        $this->apikeyfallback = get_config('aiprovider_gemini', 'apikey_fallback') ?? '';
 
         // Read model from aiprovider_gemini (default: gemini-3.1-flash-lite).
         $this->model = get_config('aiprovider_gemini', 'action_generate_text_model');
@@ -207,12 +190,20 @@ EOD;
 
         $lasterror = '';
 
-        // Try each API key with failover.
-        foreach ($this->apikeys as $keyindex => $key) {
+        // Try primary key, then fallback on auth errors only.
+        $keystotry = [];
+        if (!empty($this->apikey)) {
+            $keystotry[] = ['key' => $this->apikey, 'label' => 'primary'];
+        }
+        if (!empty($this->apikeyfallback)) {
+            $keystotry[] = ['key' => $this->apikeyfallback, 'label' => 'fallback'];
+        }
+
+        foreach ($keystotry as $keyinfo) {
             try {
                 $response = $client->post(self::API_BASE . '/batches', [
                     'headers' => [
-                        'x-goog-api-key' => $key,
+                        'x-goog-api-key' => $keyinfo['key'],
                         'Content-Type' => 'application/json',
                     ],
                     'json' => $requestbody,
@@ -226,8 +217,6 @@ EOD;
                     $jobname = $body->name;
 
                     // Store all batch items in DB for later retrieval.
-                    $batchid = $this->store_batch_job($jobname, $quizid, $courseid, $USER->id, count($inlinedrequests));
-
                     foreach ($requestmap as $idx => $map) {
                         $this->record_batch_item(
                             $quizid, $courseid, $jobname,
@@ -242,31 +231,31 @@ EOD;
                         'success' => true,
                         'job_name' => $jobname,
                         'total_requests' => count($inlinedrequests),
-                        'api_key_index' => $keyindex,
+                        'key_used' => $keyinfo['label'],
                     ];
                 }
 
-                // Rate limited or auth error — try next key.
-                if (in_array($status, [429, 401, 403]) && $keyindex < count($this->apikeys) - 1) {
-                    $lasterror = "Key {$keyindex}: HTTP {$status} - " . ($body->error->message ?? 'Unknown');
+                // Auth error — try fallback key if available.
+                if (in_array($status, [401, 403]) && count($keystotry) > 1) {
+                    $lasterror = "{$keyinfo['label']}: HTTP {$status} - " . ($body->error->message ?? 'Auth error');
                     continue;
                 }
 
-                // Other error — don't retry.
+                // Rate limit or other error — don't try another key.
                 return (object) [
                     'success' => false,
                     'error' => "Gemini API error {$status}: " . ($body->error->message ?? $response->getReasonPhrase()),
                 ];
 
             } catch (\Exception $e) {
-                $lasterror = "Key {$keyindex}: " . $e->getMessage();
+                $lasterror = "{$keyinfo['label']}: " . $e->getMessage();
                 continue;
             }
         }
 
         return (object) [
             'success' => false,
-            'error' => 'All API keys failed. Last error: ' . $lasterror,
+            'error' => 'Both API keys failed. Last error: ' . $lasterror,
         ];
     }
 
@@ -279,8 +268,16 @@ EOD;
     public function poll_batch_status(string $jobname): object {
         $client = \core\di::get(http_client::class);
 
-        // Try each key until one works.
-        foreach ($this->apikeys as $key) {
+        // Try primary key, then fallback on auth errors.
+        $keystotry = [];
+        if (!empty($this->apikey)) {
+            $keystotry[] = $this->apikey;
+        }
+        if (!empty($this->apikeyfallback)) {
+            $keystotry[] = $this->apikeyfallback;
+        }
+
+        foreach ($keystotry as $key) {
             try {
                 $response = $client->get(self::API_BASE . '/' . $jobname, [
                     'headers' => [
@@ -329,8 +326,8 @@ EOD;
                     return $result;
                 }
 
-                // Auth error with this key, try next.
-                if (in_array($status, [401, 403])) {
+                // Auth error — try fallback key.
+                if (in_array($status, [401, 403]) && count($keystotry) > 1) {
                     continue;
                 }
 
@@ -499,32 +496,6 @@ EOD;
                 $this->update_batch_item($item->id, 'failed', null, null, $e->getMessage());
             }
         }
-    }
-
-    /**
-     * Store a batch job record.
-     *
-     * @param string $jobname The batch job name from Gemini.
-     * @param int $quizid The quiz ID.
-     * @param int $courseid The course ID.
-     * @param int $userid The teacher's user ID.
-     * @param int $totalrequests Total number of requests in batch.
-     * @return int The inserted record ID.
-     */
-    private function store_batch_job(string $jobname, int $quizid, int $courseid, int $userid, int $totalrequests): int {
-        global $DB;
-
-        $record = (object) [
-            'batch_job' => $jobname,
-            'quizid' => $quizid,
-            'courseid' => $courseid,
-            'userid' => $userid,
-            'request_index' => -1, // Summary row.
-            'status' => 'submitted',
-            'timecreated' => time(),
-        ];
-
-        return $DB->insert_record('quiz_autograde_batch', $record);
     }
 
     /**

@@ -284,10 +284,10 @@ function quiz_autograde_generate_grade($attempt, $contextid, $maxretries = QUIZ_
                 $error = $response->get_errormessage();
                 $lasterror = "Error {$errorcode}: {$error}";
 
-                // If rate limited (429), retry — the provider may have failed over to a new key.
-                // If auth error (401/403), retry — same reason.
-                // For other errors, don't retry.
-                if (!in_array($errorcode, [429, 401, 403, 500, 503])) {
+                // If auth error (401/403), retry with fallback key.
+                // Rate limit (429) is per-project so retrying won't help.
+                // Server errors (500/503) may be transient, retry.
+                if (!in_array($errorcode, [401, 403, 500, 503])) {
                     return (object) [
                         'success' => false,
                         'grade' => null,
