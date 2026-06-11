@@ -299,15 +299,19 @@ EOD;
                 if ($status === 200) {
                     $body = json_decode($response->getBody()->getContents());
 
-                    $jobstate = $body->state ?? ($body->response->state ?? 'BATCH_STATE_UNSPECIFIED');
+                    $jobstate = $body->state ?? ($body->response->state ?? 'UNKNOWN');
                     $done = $body->done ?? false;
+
+                    // Normalise state (API may return BATCH_STATE_* or JOB_STATE_*).
+                    $statelabel = $jobstate;
+                    $statelabel = str_replace(['BATCH_STATE_', 'JOB_STATE_'], '', $statelabel);
+                    $statelabel = strtolower($statelabel);
 
                     // If not done yet, report current state.
                     if (!$done) {
-                        $statustext = str_replace('BATCH_STATE_', '', $jobstate);
                         return (object) [
                             'success' => true,
-                            'status' => strtolower($statustext),
+                            'status' => $statelabel,
                             'done' => false,
                             'job_name' => $jobname,
                         ];
@@ -315,21 +319,33 @@ EOD;
 
                     $result = (object) [
                         'success' => true,
-                        'status' => strtolower(str_replace('BATCH_STATE_', '', $jobstate)),
+                        'status' => $statelabel,
                         'done' => true,
                         'job_name' => $jobname,
                     ];
 
                     // Job completed — check state.
-                    if ($jobstate === 'BATCH_STATE_SUCCEEDED') {
-                        // Inline responses are nested in response.output.inlinedResponses.inlinedResponses[].
+                    $issucceeded = in_array($jobstate, ['BATCH_STATE_SUCCEEDED', 'JOB_STATE_SUCCEEDED']);
+                    $isfailed = in_array($jobstate, ['BATCH_STATE_FAILED', 'JOB_STATE_FAILED']);
+
+                    if ($issucceeded) {
+                        // Try multiple response paths for inline results.
                         $responses = null;
+                        // Path 1: Operation wrapper → response.output.inlinedResponses.inlinedResponses[].
                         if (isset($body->response->output->inlinedResponses->inlinedResponses)) {
                             $responses = $body->response->output->inlinedResponses->inlinedResponses;
-                        } elseif (isset($body->response->inlinedResponses)) {
+                        }
+                        // Path 2: response.inlinedResponses (flat).
+                        if (!$responses && isset($body->response->inlinedResponses)) {
                             $responses = $body->response->inlinedResponses;
-                        } elseif (isset($body->output->inlinedResponses->inlinedResponses)) {
+                        }
+                        // Path 3: top-level output.inlinedResponses.inlinedResponses[].
+                        if (!$responses && isset($body->output->inlinedResponses->inlinedResponses)) {
                             $responses = $body->output->inlinedResponses->inlinedResponses;
+                        }
+                        // Path 4: top-level dest.inlinedResponses (Python SDK naming).
+                        if (!$responses && isset($body->dest->inlinedResponses)) {
+                            $responses = $body->dest->inlinedResponses;
                         }
                         if ($responses) {
                             $result->responses = $responses;
@@ -338,9 +354,12 @@ EOD;
                         if (isset($body->response->output->responsesFile)) {
                             $result->result_file = $body->response->output->responsesFile;
                         }
+                        if (isset($body->dest->file_name)) {
+                            $result->result_file = $body->dest->file_name;
+                        }
                     }
 
-                    if ($jobstate === 'BATCH_STATE_FAILED') {
+                    if ($isfailed) {
                         $result->error = $body->error->message ?? 'Batch job failed with no error details.';
                     }
 
