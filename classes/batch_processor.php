@@ -178,13 +178,22 @@ EOD;
         }
 
         // Create the batch job via REST API.
+        // Endpoint: POST /v1beta/models/{model}:batchGenerateContent
         $client = \core\di::get(http_client::class);
+
+        // Wrap each request in the InlinedRequest envelope.
+        $wrappedrequests = [];
+        foreach ($inlinedrequests as $req) {
+            $wrappedrequests[] = ['request' => $req];
+        }
 
         $requestbody = [
             'model' => 'models/' . $this->model,
-            'inlinedRequests' => $inlinedrequests,
-            'config' => [
-                'displayName' => "quiz_autograde_quiz{$quizid}_" . date('Ymd_His'),
+            'displayName' => "quiz_autograde_quiz{$quizid}_" . date('Ymd_His'),
+            'inputConfig' => [
+                'requests' => [
+                    'requests' => $wrappedrequests,
+                ],
             ],
         ];
 
@@ -201,7 +210,7 @@ EOD;
 
         foreach ($keystotry as $keyinfo) {
             try {
-                $response = $client->post(self::API_BASE . '/batches', [
+                $response = $client->post(self::API_BASE . '/models/' . $this->model . ':batchGenerateContent', [
                     'headers' => [
                         'x-goog-api-key' => $keyinfo['key'],
                         'Content-Type' => 'application/json',
@@ -290,37 +299,49 @@ EOD;
                 if ($status === 200) {
                     $body = json_decode($response->getBody()->getContents());
 
-                    $jobstate = $body->metadata->state ?? $body->state ?? 'UNKNOWN';
+                    $jobstate = $body->state ?? ($body->response->state ?? 'BATCH_STATE_UNSPECIFIED');
                     $done = $body->done ?? false;
+
+                    // If not done yet, report current state.
+                    if (!$done) {
+                        $statustext = str_replace('BATCH_STATE_', '', $jobstate);
+                        return (object) [
+                            'success' => true,
+                            'status' => strtolower($statustext),
+                            'done' => false,
+                            'job_name' => $jobname,
+                        ];
+                    }
 
                     $result = (object) [
                         'success' => true,
-                        'status' => $jobstate,
-                        'done' => $done,
+                        'status' => strtolower(str_replace('BATCH_STATE_', '', $jobstate)),
+                        'done' => true,
                         'job_name' => $jobname,
                     ];
 
-                    // If job completed, include results for processing.
-                    if ($done && $jobstate === 'JOB_STATE_SUCCEEDED') {
-                        // Inline responses are in the response object.
-                        if (isset($body->response->inlinedResponses)) {
-                            $result->responses = $body->response->inlinedResponses;
+                    // Job completed — check state.
+                    if ($jobstate === 'BATCH_STATE_SUCCEEDED') {
+                        // Inline responses are nested in response.output.inlinedResponses.inlinedResponses[].
+                        $responses = null;
+                        if (isset($body->response->output->inlinedResponses->inlinedResponses)) {
+                            $responses = $body->response->output->inlinedResponses->inlinedResponses;
+                        } elseif (isset($body->response->inlinedResponses)) {
+                            $responses = $body->response->inlinedResponses;
+                        } elseif (isset($body->output->inlinedResponses->inlinedResponses)) {
+                            $responses = $body->output->inlinedResponses->inlinedResponses;
                         }
-                        // File-based responses have a file reference.
-                        if (isset($body->response->destFile)) {
-                            $result->result_file = $body->response->destFile;
+                        if ($responses) {
+                            $result->responses = $responses;
                         }
-                        // Check for inline responses at different paths.
-                        if (isset($body->dest->inlinedResponses)) {
-                            $result->responses = $body->dest->inlinedResponses;
-                        }
-                        if (isset($body->dest->file_name)) {
-                            $result->result_file = $body->dest->file_name;
+                        // File-based output.
+                        if (isset($body->response->output->responsesFile)) {
+                            $result->result_file = $body->response->output->responsesFile;
                         }
                     }
 
-                    if ($done && $jobstate === 'JOB_STATE_FAILED') {
-                        $result->error = $body->error ?? 'Batch job failed with no error details.';
+                    if ($jobstate === 'BATCH_STATE_FAILED') {
+                        $result->error = $body->error->message ?? 'Batch job failed with no error details.';
                     }
 
                     return $result;
@@ -385,25 +406,23 @@ EOD;
 
             $item = $itemsbyindex[$idx];
 
-            // Check for error on this specific response.
+            // InlinedResponse has: response (GenerateContentResponse) or error (Status).
             if (isset($responseobj->error)) {
                 $failed++;
+                $errormsg = is_object($responseobj->error) ? ($responseobj->error->message ?? json_encode($responseobj->error)) : strval($responseobj->error);
                 $failuredetails[] = [
                     'student' => $item->student_name,
                     'question' => $item->question_name,
-                    'error' => $responseobj->error->message ?? json_encode($responseobj->error),
+                    'error' => $errormsg,
                 ];
-                $this->update_batch_item($item->id, 'failed', null, null, $responseobj->error->message ?? 'Unknown error');
+                $this->update_batch_item($item->id, 'failed', null, null, $errormsg);
                 continue;
             }
 
-            // Extract generated text from the response.
+            // Extract generated text from the GenerateContentResponse.
             $generatedtext = '';
-            if (isset($responseobj->response)) {
-                $resp = $responseobj->response;
-                if (isset($resp->candidates[0]->content->parts[0]->text)) {
-                    $generatedtext = $resp->candidates[0]->content->parts[0]->text;
-                }
+            if (isset($responseobj->response->candidates[0]->content->parts[0]->text)) {
+                $generatedtext = $responseobj->response->candidates[0]->content->parts[0]->text;
             }
 
             if (empty($generatedtext)) {
