@@ -62,6 +62,9 @@ class run_autograde extends external_api {
      * @return string The result summary (JSON with graded, failed, details)
      */
     public static function execute($quizid, $courseid) {
+        // Extend time limit — grading many essays with throttling can take several minutes.
+        set_time_limit(0);
+
         $params = self::validate_parameters(
             self::execute_parameters(),
             ['quizID' => $quizid, 'courseID' => $courseid]

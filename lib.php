@@ -217,7 +217,7 @@ define('QUIZ_AUTOGRADE_DEFAULT_RETRIES', 2);
  * Default delay in seconds between API calls to avoid rate limiting.
  * Set to 0 for no delay, or a positive number for seconds between calls.
  */
-define('QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS', 2);
+define('QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS', 5);
 
 /**
  * Generates a grade for an essay attempt using an AI service, with retry support.
