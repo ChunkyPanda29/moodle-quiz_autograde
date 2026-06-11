@@ -26,30 +26,9 @@
 defined('MOODLE_INTERNAL') || die();
 
 $functions = [
-    'quiz_autograde_run' => [
+    'quiz_autograde_run_autograde' => [
         'classname'   => 'quiz_autograde\external\run_autograde',
-        'description' => 'Sends answers to essay questions to an AI service for grading (single-request mode).',
-        'type'        => 'write',
-        'ajax'        => true,
-        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
-    ],
-    'quiz_autograde_create_batch' => [
-        'classname'   => 'quiz_autograde\external\create_batch_job',
-        'description' => 'Creates a Gemini batch job for bulk essay grading.',
-        'type'        => 'write',
-        'ajax'        => true,
-        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
-    ],
-    'quiz_autograde_poll_batch' => [
-        'classname'   => 'quiz_autograde\external\poll_batch_status',
-        'description' => 'Polls the status of a Gemini batch grading job.',
-        'type'        => 'read',
-        'ajax'        => true,
-        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
-    ],
-    'quiz_autograde_process_batch' => [
-        'classname'   => 'quiz_autograde\external\process_batch_results',
-        'description' => 'Processes results from a completed batch job and applies grades.',
+        'description' => 'Grades essay answers grouped by question using AI (provider-agnostic).',
         'type'        => 'write',
         'ajax'        => true,
         'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
