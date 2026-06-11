@@ -27,6 +27,10 @@ require_once($CFG->dirroot . '/mod/quiz/report/autograde/lib.php');
 /**
  * Class run_autograde
  *
+ * Grades all essay answers grouped by question. Each question's student answers
+ * are sent to the AI in a single batch prompt, reducing API calls from N (per essay)
+ * to Q (per question). Provider-agnostic — works with any Moodle AI provider.
+ *
  * @package    quiz_autograde
  * @copyright  2026 Christian Grévisse <christian.grevisse@uni.lu>
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
@@ -52,17 +56,17 @@ class run_autograde extends external_api {
     }
 
     /**
-     * Grade essay questions of a quiz attempt using an AI service.
+     * Grade essay questions of a quiz, grouped by question for efficiency.
      *
-     * Continues processing on individual failures and returns a summary
-     * of graded and failed questions.
+     * Groups all student answers by question slot, sends one AI request per
+     * question containing all student answers, then splits and applies grades.
      *
-     * @param int $quizid The ID of the quiz
-     * @param int $courseid The ID of the course
-     * @return string The result summary (JSON with graded, failed, details)
+     * @param int $quizid The ID of the quiz.
+     * @param int $courseid The ID of the course.
+     * @return string JSON result summary.
      */
     public static function execute($quizid, $courseid) {
-        // Extend time limit — grading many essays with throttling can take several minutes.
+        // Extend time limit — grading with API calls can take several minutes.
         set_time_limit(0);
 
         $params = self::validate_parameters(
@@ -78,59 +82,123 @@ class run_autograde extends external_api {
 
         $essayattempts = quiz_autograde_get_essay_attempts($quizid);
 
-        $questionsgraded = 0;
-        $questionsfailed = 0;
-        $questionsskipped = 0;
-        $failuredetails = [];
+        // Group ungraded attempts by question slot.
+        $byquestion = [];
+        $questioninfo = [];
+        $alreadyskipped = 0;
+        $emptygraded = 0;
 
-        foreach ($essayattempts as $attempt) {
-            $attempt = (object) $attempt;
+        foreach ($essayattempts as $attemptdata) {
+            $attempt = (object) $attemptdata;
 
-            $alreadygraded = $attempt->graded;
-            $nograderinfo = strlen($attempt->graderinfo) == 0;
-
-            // Skip if already graded or no grader info.
-            if ($alreadygraded || $nograderinfo) {
-                $questionsskipped++;
+            // Skip already graded.
+            if ($attempt->graded) {
+                $alreadyskipped++;
                 continue;
             }
 
-            if (strlen($attempt->answer) == 0) {
-                // No answer provided, set grade to 0.
-                quiz_autograde_set_grade($attempt, 0, get_string('noanswer', 'quiz_autograde'));
-                $questionsgraded++;
-            } else {
-                // Grade by LLM (with retry support).
-                $result = quiz_autograde_generate_grade($attempt, $context->id);
+            // Skip no grader info.
+            if (strlen($attempt->graderinfo) === 0) {
+                $alreadyskipped++;
+                continue;
+            }
 
-                if ($result->success) {
-                    $grade = max(0, min($attempt->maxmark, $result->grade));
-                    $comment = $result->comment;
-                    quiz_autograde_set_grade($attempt, $grade, $comment);
-                    $questionsgraded++;
+            // Empty answers get grade 0 immediately.
+            if (strlen($attempt->answer) === 0) {
+                quiz_autograde_set_grade($attempt, 0, get_string('noanswer', 'quiz_autograde'));
+                $emptygraded++;
+                continue;
+            }
+
+            $slot = $attempt->slot;
+
+            if (!isset($byquestion[$slot])) {
+                $byquestion[$slot] = [];
+                $questioninfo[$slot] = (object) [
+                    'questiontext' => $attempt->questiontext,
+                    'graderinfo' => $attempt->graderinfo,
+                    'questionname' => $attempt->questionname,
+                ];
+            }
+
+            $byquestion[$slot][] = (object) [
+                'student' => $attempt->student,
+                'answer' => $attempt->answer,
+                'maxmark' => $attempt->maxmark,
+                'attemptid' => $attempt->attemptid,
+                'slot' => $attempt->slot,
+            ];
+        }
+
+        // If nothing to grade, return early.
+        if (empty($byquestion) && $emptygraded === 0) {
+            return json_encode([
+                'graded' => 0,
+                'failed' => 0,
+                'skipped' => $alreadyskipped,
+                'total' => count($essayattempts),
+                'questions' => 0,
+            ]);
+        }
+
+        $questionsgraded = $emptygraded;
+        $questionsfailed = 0;
+        $failuredetails = [];
+        $questioncount = count($byquestion);
+        $qprocessed = 0;
+
+        // Process each question group.
+        foreach ($byquestion as $slot => $students) {
+            $qprocessed++;
+            $qinfo = $questioninfo[$slot];
+            $studentcount = count($students);
+
+            // Send one AI request for all students on this question.
+            $results = quiz_autograde_grade_question_batch($students, $qinfo, $context->id);
+
+            // Apply grades.
+            foreach ($students as $i => $s) {
+                $r = $results[$i] ?? (object) ['success' => false, 'error' => 'No result from AI'];
+
+                if ($r->success) {
+                    $attempt = (object) [
+                        'attemptid' => $s->attemptid,
+                        'slot' => $s->slot,
+                        'maxmark' => $s->maxmark,
+                    ];
+                    try {
+                        quiz_autograde_set_grade($attempt, $r->grade, $r->comment);
+                        $questionsgraded++;
+                    } catch (\Exception $e) {
+                        $questionsfailed++;
+                        $failuredetails[] = [
+                            'student' => $s->student,
+                            'question' => $qinfo->questionname,
+                            'error' => $e->getMessage(),
+                        ];
+                    }
                 } else {
-                    // Don't throw — record the failure and continue.
                     $questionsfailed++;
                     $failuredetails[] = [
-                        'student' => $attempt->student,
-                        'question' => $attempt->questionname,
-                        'error' => $result->error,
+                        'student' => $s->student,
+                        'question' => $qinfo->questionname,
+                        'error' => $r->error ?? 'Unknown error',
                     ];
                 }
             }
 
-            // Throttle between API calls to reduce rate limit pressure.
-            if (QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS > 0) {
+            // Throttle between question groups.
+            if ($qprocessed < $questioncount && QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS > 0) {
                 sleep(QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS);
             }
         }
 
-        // Build a JSON result for the frontend to parse.
         $result = [
             'graded' => $questionsgraded,
             'failed' => $questionsfailed,
-            'skipped' => $questionsskipped,
+            'skipped' => $alreadyskipped,
             'total' => count($essayattempts),
+            'questions' => $questioncount,
         ];
 
         if ($questionsfailed > 0) {
