@@ -25,7 +25,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'quiz_autograde';
-$plugin->release = '0.1.0';
-$plugin->version = 2026032800;
+$plugin->release = '0.2.0';
+$plugin->version = 2026061100;
 $plugin->requires = 2024100708;
 $plugin->maturity = MATURITY_BETA;

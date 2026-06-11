@@ -1,0 +1,590 @@
+<?php
+// This file is part of Moodle - http://moodle.org/
+//
+// Moodle is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Moodle is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
+
+namespace quiz_autograde;
+
+use core\http_client;
+use GuzzleHttp\RequestOptions;
+
+defined('MOODLE_INTERNAL') || die();
+
+/**
+ * Handles Gemini Batch API communication for bulk essay grading.
+ *
+ * Uses the aiprovider_gemini plugin's API keys and model configuration.
+ * Flow: build inline requests → create batch job → poll status → retrieve results.
+ *
+ * @package    quiz_autograde
+ * @copyright  2026 Kristen Goliath
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+class batch_processor {
+
+    /** @var string Gemini API key (first available from aiprovider_gemini) */
+    private string $apikey;
+
+    /** @var array All available API keys for failover */
+    private array $apikeys;
+
+    /** @var string Gemini model to use */
+    private string $model;
+
+    /** @var string Base URL for Gemini API */
+    private const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+    /**
+     * Constructor. Reads config from aiprovider_gemini.
+     */
+    public function __construct() {
+        // Read multi-key config from aiprovider_gemini.
+        $apikeysraw = get_config('aiprovider_gemini', 'apikeys');
+        if (!empty($apikeysraw)) {
+            $keys = array_filter(
+                array_map('trim', explode("\n", $apikeysraw)),
+                fn($key) => !empty($key)
+            );
+            $this->apikeys = array_values($keys);
+        }
+
+        // Fallback to legacy single key.
+        if (empty($this->apikeys)) {
+            $legacykey = get_config('aiprovider_gemini', 'apikey');
+            if (!empty($legacykey)) {
+                $this->apikeys = [$legacykey];
+            }
+        }
+
+        $this->apikey = $this->apikeys[0] ?? '';
+
+        // Read model from aiprovider_gemini (default: gemini-3.1-flash-lite).
+        $this->model = get_config('aiprovider_gemini', 'action_generate_text_model');
+        if (empty($this->model)) {
+            $this->model = 'gemini-3.1-flash-lite';
+        }
+    }
+
+    /**
+     * Check if batch mode is available (has API keys configured).
+     *
+     * @return bool
+     */
+    public function is_available(): bool {
+        return !empty($this->apikey);
+    }
+
+    /**
+     * Build the grading prompt for a single essay attempt.
+     *
+     * @param object $attempt The essay attempt data.
+     * @return string The prompt text.
+     */
+    public static function build_grading_prompt(object $attempt): string {
+        return <<<EOD
+You are a helpful and precise assistant for grading student answers to essay questions.
+
+This is the question:
+---------------------
+{$attempt->questiontext}
+---------------------
+This is the model answer and grading information for the question, provided by the teacher:
+---------------------
+{$attempt->graderinfo}
+---------------------
+This is the student's answer that you need to grade:
+---------------------
+{$attempt->answer}
+---------------------
+Suggest an accurate grade for the student's answer to the given question considering the grading information,
+and provide a concise explanation for the grade. The grade should be a number between 0 and {$attempt->maxmark}.
+
+Give your answer in the following JSON format:
+
+---------------------
+{
+    "grade": (the grade as a number),
+    "comment": (the explanation for the grade)
+}
+---------------------
+
+Only return valid JSON in the specified format, without any additional text. Make sure the JSON is properly formatted.
+EOD;
+    }
+
+    /**
+     * Create a batch grading job using Gemini's inline Batch API.
+     *
+     * @param array $essayattempts Array of essay attempt objects to grade.
+     * @param int $quizid The quiz ID.
+     * @param int $courseid The course ID.
+     * @return object Result with 'success', 'job_name', 'request_map', 'error'.
+     */
+    public function create_batch_job(array $essayattempts, int $quizid, int $courseid): object {
+        global $DB, $USER;
+
+        if (empty($this->apikey)) {
+            return (object) [
+                'success' => false,
+                'error' => 'No Gemini API key configured. Configure keys in aiprovider_gemini settings.',
+            ];
+        }
+
+        // Build inline requests and mapping.
+        $inlinedrequests = [];
+        $requestmap = []; // Maps index → attempt info for DB storage.
+        $index = 0;
+
+        foreach ($essayattempts as $attemptdata) {
+            $attempt = (object) $attemptdata;
+
+            // Skip already graded or no grader info.
+            if ($attempt->graded || strlen($attempt->graderinfo) == 0) {
+                continue;
+            }
+
+            // Skip empty answers (will be handled separately with grade 0).
+            if (strlen($attempt->answer) == 0) {
+                // Record as auto-graded 0.
+                $this->record_batch_item($quizid, $courseid, 'pending', $attempt, null, 0, get_string('noanswer', 'quiz_autograde'));
+                continue;
+            }
+
+            $prompt = self::build_grading_prompt($attempt);
+
+            $inlinedrequests[] = [
+                'contents' => [
+                    [
+                        'role' => 'user',
+                        'parts' => [['text' => $prompt]],
+                    ],
+                ],
+                'generationConfig' => [
+                    'responseMimeType' => 'application/json',
+                ],
+            ];
+
+            // Store mapping for this index.
+            $requestmap[$index] = [
+                'attemptid' => $attempt->attemptid,
+                'slot' => $attempt->slot,
+                'maxmark' => $attempt->maxmark,
+                'student' => $attempt->student,
+                'questionname' => $attempt->questionname,
+            ];
+
+            $index++;
+        }
+
+        if (empty($inlinedrequests)) {
+            return (object) [
+                'success' => false,
+                'error' => 'No essays to grade (all already graded or no grading info).',
+            ];
+        }
+
+        // Create the batch job via REST API.
+        $client = \core\di::get(http_client::class);
+
+        $requestbody = [
+            'model' => 'models/' . $this->model,
+            'inlinedRequests' => $inlinedrequests,
+            'config' => [
+                'displayName' => "quiz_autograde_quiz{$quizid}_" . date('Ymd_His'),
+            ],
+        ];
+
+        $lasterror = '';
+
+        // Try each API key with failover.
+        foreach ($this->apikeys as $keyindex => $key) {
+            try {
+                $response = $client->post(self::API_BASE . '/batches', [
+                    'headers' => [
+                        'x-goog-api-key' => $key,
+                        'Content-Type' => 'application/json',
+                    ],
+                    'json' => $requestbody,
+                    RequestOptions::HTTP_ERRORS => false,
+                ]);
+
+                $status = $response->getStatusCode();
+                $body = json_decode($response->getBody()->getContents());
+
+                if ($status === 200 || $status === 201) {
+                    $jobname = $body->name;
+
+                    // Store all batch items in DB for later retrieval.
+                    $batchid = $this->store_batch_job($jobname, $quizid, $courseid, $USER->id, count($inlinedrequests));
+
+                    foreach ($requestmap as $idx => $map) {
+                        $this->record_batch_item(
+                            $quizid, $courseid, $jobname,
+                            (object) $map, $idx
+                        );
+                    }
+
+                    // Also grade any empty answers immediately.
+                    $this->process_empty_answers($quizid, $courseid);
+
+                    return (object) [
+                        'success' => true,
+                        'job_name' => $jobname,
+                        'total_requests' => count($inlinedrequests),
+                        'api_key_index' => $keyindex,
+                    ];
+                }
+
+                // Rate limited or auth error — try next key.
+                if (in_array($status, [429, 401, 403]) && $keyindex < count($this->apikeys) - 1) {
+                    $lasterror = "Key {$keyindex}: HTTP {$status} - " . ($body->error->message ?? 'Unknown');
+                    continue;
+                }
+
+                // Other error — don't retry.
+                return (object) [
+                    'success' => false,
+                    'error' => "Gemini API error {$status}: " . ($body->error->message ?? $response->getReasonPhrase()),
+                ];
+
+            } catch (\Exception $e) {
+                $lasterror = "Key {$keyindex}: " . $e->getMessage();
+                continue;
+            }
+        }
+
+        return (object) [
+            'success' => false,
+            'error' => 'All API keys failed. Last error: ' . $lasterror,
+        ];
+    }
+
+    /**
+     * Poll a batch job's status.
+     *
+     * @param string $jobname The batch job name (e.g., "batches/123456").
+     * @return object Result with 'status', 'done', and optionally results or error.
+     */
+    public function poll_batch_status(string $jobname): object {
+        $client = \core\di::get(http_client::class);
+
+        // Try each key until one works.
+        foreach ($this->apikeys as $key) {
+            try {
+                $response = $client->get(self::API_BASE . '/' . $jobname, [
+                    'headers' => [
+                        'x-goog-api-key' => $key,
+                    ],
+                    RequestOptions::HTTP_ERRORS => false,
+                ]);
+
+                $status = $response->getStatusCode();
+                if ($status === 200) {
+                    $body = json_decode($response->getBody()->getContents());
+
+                    $jobstate = $body->metadata->state ?? $body->state ?? 'UNKNOWN';
+                    $done = $body->done ?? false;
+
+                    $result = (object) [
+                        'success' => true,
+                        'status' => $jobstate,
+                        'done' => $done,
+                        'job_name' => $jobname,
+                    ];
+
+                    // If job completed, include results for processing.
+                    if ($done && $jobstate === 'JOB_STATE_SUCCEEDED') {
+                        // Inline responses are in the response object.
+                        if (isset($body->response->inlinedResponses)) {
+                            $result->responses = $body->response->inlinedResponses;
+                        }
+                        // File-based responses have a file reference.
+                        if (isset($body->response->destFile)) {
+                            $result->result_file = $body->response->destFile;
+                        }
+                        // Check for inline responses at different paths.
+                        if (isset($body->dest->inlinedResponses)) {
+                            $result->responses = $body->dest->inlinedResponses;
+                        }
+                        if (isset($body->dest->file_name)) {
+                            $result->result_file = $body->dest->file_name;
+                        }
+                    }
+
+                    if ($done && $jobstate === 'JOB_STATE_FAILED') {
+                        $result->error = $body->error ?? 'Batch job failed with no error details.';
+                    }
+
+                    return $result;
+                }
+
+                // Auth error with this key, try next.
+                if (in_array($status, [401, 403])) {
+                    continue;
+                }
+
+                return (object) [
+                    'success' => false,
+                    'error' => "HTTP {$status} polling job status.",
+                ];
+
+            } catch (\Exception $e) {
+                continue;
+            }
+        }
+
+        return (object) [
+            'success' => false,
+            'error' => 'Could not poll batch job status with any API key.',
+        ];
+    }
+
+    /**
+     * Process completed batch results and apply grades.
+     *
+     * @param string $jobname The batch job name.
+     * @param array $responses Array of inline response objects from Gemini.
+     * @return object Summary with 'graded', 'failed', 'details'.
+     */
+    public function process_batch_results(string $jobname, array $responses): object {
+        global $DB;
+
+        // Load all batch items for this job.
+        $items = $DB->get_records('quiz_autograde_batch', ['batch_job' => $jobname, 'status' => 'pending']);
+
+        if (empty($items)) {
+            return (object) [
+                'graded' => 0,
+                'failed' => 0,
+                'error' => 'No pending items found for this batch job.',
+            ];
+        }
+
+        $graded = 0;
+        $failed = 0;
+        $failuredetails = [];
+
+        // Map items by request_index for O(1) lookup.
+        $itemsbyindex = [];
+        foreach ($items as $item) {
+            $itemsbyindex[$item->request_index] = $item;
+        }
+
+        foreach ($responses as $idx => $responseobj) {
+            if (!isset($itemsbyindex[$idx])) {
+                continue;
+            }
+
+            $item = $itemsbyindex[$idx];
+
+            // Check for error on this specific response.
+            if (isset($responseobj->error)) {
+                $failed++;
+                $failuredetails[] = [
+                    'student' => $item->student_name,
+                    'question' => $item->question_name,
+                    'error' => $responseobj->error->message ?? json_encode($responseobj->error),
+                ];
+                $this->update_batch_item($item->id, 'failed', null, null, $responseobj->error->message ?? 'Unknown error');
+                continue;
+            }
+
+            // Extract generated text from the response.
+            $generatedtext = '';
+            if (isset($responseobj->response)) {
+                $resp = $responseobj->response;
+                if (isset($resp->candidates[0]->content->parts[0]->text)) {
+                    $generatedtext = $resp->candidates[0]->content->parts[0]->text;
+                }
+            }
+
+            if (empty($generatedtext)) {
+                $failed++;
+                $failuredetails[] = [
+                    'student' => $item->student_name,
+                    'question' => $item->question_name,
+                    'error' => get_string('emptyresponse', 'quiz_autograde'),
+                ];
+                $this->update_batch_item($item->id, 'failed', null, null, 'Empty response from API');
+                continue;
+            }
+
+            // Parse the JSON response.
+            $data = json_decode($generatedtext);
+
+            if ($data === null || !isset($data->grade) || !is_numeric($data->grade)) {
+                $failed++;
+                $failuredetails[] = [
+                    'student' => $item->student_name,
+                    'question' => $item->question_name,
+                    'error' => get_string('invalidresponse', 'quiz_autograde', substr($generatedtext, 0, 200)),
+                ];
+                $this->update_batch_item($item->id, 'failed', null, null, 'Invalid JSON: ' . substr($generatedtext, 0, 200));
+                continue;
+            }
+
+            // Apply the grade.
+            $grade = max(0, min((float) $item->maxmark, (float) $data->grade));
+            $comment = $data->comment ?? get_string('noexplanation', 'quiz_autograde');
+
+            $attempt = (object) [
+                'attemptid' => $item->attemptid,
+                'slot' => $item->slot,
+                'maxmark' => $item->maxmark,
+            ];
+
+            try {
+                quiz_autograde_set_grade($attempt, $grade, $comment);
+                $graded++;
+                $this->update_batch_item($item->id, 'graded', $grade, $comment);
+            } catch (\Exception $e) {
+                $failed++;
+                $failuredetails[] = [
+                    'student' => $item->student_name,
+                    'question' => $item->question_name,
+                    'error' => $e->getMessage(),
+                ];
+                $this->update_batch_item($item->id, 'failed', null, null, $e->getMessage());
+            }
+        }
+
+        return (object) [
+            'graded' => $graded,
+            'failed' => $failed,
+            'failures' => $failuredetails,
+        ];
+    }
+
+    /**
+     * Process empty answers (auto-grade as 0) for a quiz.
+     *
+     * @param int $quizid The quiz ID.
+     * @param int $courseid The course ID.
+     */
+    private function process_empty_answers(int $quizid, int $courseid): void {
+        global $DB;
+
+        $emptyitems = $DB->get_records('quiz_autograde_batch', [
+            'quizid' => $quizid,
+            'status' => 'pending',
+            'grade' => null,
+        ]);
+
+        foreach ($emptyitems as $item) {
+            if (empty($item->attemptid)) {
+                continue;
+            }
+
+            $attempt = (object) [
+                'attemptid' => $item->attemptid,
+                'slot' => $item->slot,
+                'maxmark' => $item->maxmark,
+            ];
+
+            try {
+                quiz_autograde_set_grade($attempt, 0, get_string('noanswer', 'quiz_autograde'));
+                $this->update_batch_item($item->id, 'graded', 0, get_string('noanswer', 'quiz_autograde'));
+            } catch (\Exception $e) {
+                $this->update_batch_item($item->id, 'failed', null, null, $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Store a batch job record.
+     *
+     * @param string $jobname The batch job name from Gemini.
+     * @param int $quizid The quiz ID.
+     * @param int $courseid The course ID.
+     * @param int $userid The teacher's user ID.
+     * @param int $totalrequests Total number of requests in batch.
+     * @return int The inserted record ID.
+     */
+    private function store_batch_job(string $jobname, int $quizid, int $courseid, int $userid, int $totalrequests): int {
+        global $DB;
+
+        $record = (object) [
+            'batch_job' => $jobname,
+            'quizid' => $quizid,
+            'courseid' => $courseid,
+            'userid' => $userid,
+            'request_index' => -1, // Summary row.
+            'status' => 'submitted',
+            'timecreated' => time(),
+        ];
+
+        return $DB->insert_record('quiz_autograde_batch', $record);
+    }
+
+    /**
+     * Record a batch item for later result mapping.
+     *
+     * @param int $quizid
+     * @param int $courseid
+     * @param string $jobname
+     * @param object $map Mapping object with attemptid, slot, maxmark, student, questionname.
+     * @param int $requestindex The index of this request in the batch.
+     */
+    private function record_batch_item(int $quizid, int $courseid, string $jobname, object $map, int $requestindex): void {
+        global $DB, $USER;
+
+        $record = (object) [
+            'batch_job' => $jobname,
+            'quizid' => $quizid,
+            'courseid' => $courseid,
+            'userid' => $USER->id,
+            'request_index' => $requestindex,
+            'attemptid' => $map->attemptid ?? null,
+            'slot' => $map->slot ?? null,
+            'maxmark' => $map->maxmark ?? 0,
+            'student_name' => $map->student ?? '',
+            'question_name' => $map->questionname ?? '',
+            'status' => 'pending',
+            'timecreated' => time(),
+        ];
+
+        $DB->insert_record('quiz_autograde_batch', $record);
+    }
+
+    /**
+     * Update a batch item's status and grade.
+     *
+     * @param int $id The record ID.
+     * @param string $status New status.
+     * @param float|null $grade The grade (if graded).
+     * @param string|null $comment The comment (if graded).
+     * @param string|null $error Error message (if failed).
+     */
+    private function update_batch_item(int $id, string $status, ?float $grade = null, ?string $comment = null, ?string $error = null): void {
+        global $DB;
+
+        $update = (object) [
+            'id' => $id,
+            'status' => $status,
+            'timecompleted' => time(),
+        ];
+
+        if ($grade !== null) {
+            $update->grade = $grade;
+        }
+        if ($comment !== null) {
+            $update->comment = $comment;
+        }
+        if ($error !== null) {
+            $update->error = $error;
+        }
+
+        $DB->update_record('quiz_autograde_batch', $update);
+    }
+}

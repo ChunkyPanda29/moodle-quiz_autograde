@@ -27,11 +27,17 @@ defined('MOODLE_INTERNAL') || die();
 
 $string['autograde'] = 'AutoGrade';
 
+// Batch mode strings.
+$string['batchfailed'] = 'Batch job failed on the Gemini side.';
+$string['batchnotready'] = 'Batch job is still processing. Please wait.';
+$string['emptyresponse'] = 'Empty response received from the API.';
 $string['gradinginprogress'] = 'Grading in progress, please wait...';
 $string['invalidresponse'] = 'Invalid response: {$a}';
 $string['noanswer'] = 'No answer provided.';
+$string['noapikey'] = 'No Gemini API key configured. Please configure keys in the Gemini AI provider settings.';
 $string['noessayanswers'] = 'No essay answers found for this quiz.';
 $string['noexplanation'] = 'No explanation provided.';
+$string['noresponses'] = 'Batch completed but no responses were returned.';
 $string['notextgeneration'] = 'Text generation action is not available or not enabled for AutoGrade.';
 $string['numberofquestionsgraded'] = '{$a} questions graded.';
 $string['questionsfailed'] = '{$a} questions failed (see details below).';
@@ -41,6 +47,7 @@ $string['retryexhausted'] = 'All retry attempts failed. Last error: {$a}';
 
 $string['pluginname'] = 'AutoGrade';
 
+// Privacy.
 $string['privacy:metadata:ai_provider'] = 'Data sent to external AI providers';
 $string['privacy:metadata:ai_provider:answer'] = 'The student\'s answer to the question';
 $string['privacy:metadata:ai_provider:graderinfo'] = 'Grading information';

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<XMLDB PATH="mod/quiz/report/autograde/db" VERSION="20260611" COMMENT="XMLDB file for quiz_autograde plugin"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="../../../../lib/xmldb/xmldb.xsd"
+>
+  <TABLES>
+    <TABLE NAME="quiz_autograde_batch" COMMENT="Tracks batch grading jobs and their request-to-attempt mappings">
+      <FIELDS>
+        <FIELD NAME="id" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="true"/>
+        <FIELD NAME="batch_job" TYPE="char" LENGTH="255" NOTNULL="true" SEQUENCE="false" COMMENT="Gemini batch job name (e.g. batches/123456)"/>
+        <FIELD NAME="quizid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="courseid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="userid" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false" COMMENT="Teacher who initiated the batch"/>
+        <FIELD NAME="request_index" TYPE="int" LENGTH="10" NOTNULL="true" DEFAULT="0" SEQUENCE="false" COMMENT="Index of this request in the batch (-1 for summary row)"/>
+        <FIELD NAME="attemptid" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="Quiz attempt ID"/>
+        <FIELD NAME="slot" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="Question slot in the attempt"/>
+        <FIELD NAME="maxmark" TYPE="number" LENGTH="10" NOTNULL="false" SEQUENCE="false" DECIMALS="5" COMMENT="Maximum mark for this question"/>
+        <FIELD NAME="student_name" TYPE="char" LENGTH="255" NOTNULL="false" SEQUENCE="false" COMMENT="Student display name for error reporting"/>
+        <FIELD NAME="question_name" TYPE="char" LENGTH="255" NOTNULL="false" SEQUENCE="false" COMMENT="Question label for error reporting"/>
+        <FIELD NAME="status" TYPE="char" LENGTH="50" NOTNULL="true" DEFAULT="pending" SEQUENCE="false" COMMENT="pending, graded, failed, submitted"/>
+        <FIELD NAME="grade" TYPE="number" LENGTH="10" NOTNULL="false" SEQUENCE="false" DECIMALS="5" COMMENT="Applied grade"/>
+        <FIELD NAME="comment" TYPE="text" NOTNULL="false" SEQUENCE="false" COMMENT="AI-generated comment"/>
+        <FIELD NAME="error" TYPE="text" NOTNULL="false" SEQUENCE="false" COMMENT="Error message if failed"/>
+        <FIELD NAME="timecreated" TYPE="int" LENGTH="10" NOTNULL="true" SEQUENCE="false"/>
+        <FIELD NAME="timecompleted" TYPE="int" LENGTH="10" NOTNULL="false" SEQUENCE="false" COMMENT="When this item was graded/failed"/>
+      </FIELDS>
+      <KEYS>
+        <KEY NAME="primary" TYPE="primary" FIELDS="id"/>
+      </KEYS>
+      <INDEXES>
+        <INDEX NAME="batch_job_idx" UNIQUE="false" FIELDS="batch_job"/>
+        <INDEX NAME="quiz_status_idx" UNIQUE="false" FIELDS="quizid, status"/>
+      </INDEXES>
+    </TABLE>
+  </TABLES>
+</XMLDB>

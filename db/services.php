@@ -17,8 +17,6 @@
 /**
  * External functions and service declaration for AutoGrade
  *
- * Documentation: {@link https://moodledev.io/docs/apis/subsystems/external/description}
- *
  * @package    quiz_autograde
  * @category   webservice
  * @copyright  2026 Christian Grévisse <christian.grevisse@uni.lu>
@@ -30,7 +28,28 @@ defined('MOODLE_INTERNAL') || die();
 $functions = [
     'quiz_autograde_run' => [
         'classname'   => 'quiz_autograde\external\run_autograde',
-        'description' => 'Sends answers to essay questions to an AI service for grading.',
+        'description' => 'Sends answers to essay questions to an AI service for grading (single-request mode).',
+        'type'        => 'write',
+        'ajax'        => true,
+        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
+    ],
+    'quiz_autograde_create_batch' => [
+        'classname'   => 'quiz_autograde\external\create_batch_job',
+        'description' => 'Creates a Gemini batch job for bulk essay grading.',
+        'type'        => 'write',
+        'ajax'        => true,
+        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
+    ],
+    'quiz_autograde_poll_batch' => [
+        'classname'   => 'quiz_autograde\external\poll_batch_status',
+        'description' => 'Polls the status of a Gemini batch grading job.',
+        'type'        => 'read',
+        'ajax'        => true,
+        'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
+    ],
+    'quiz_autograde_process_batch' => [
+        'classname'   => 'quiz_autograde\external\process_batch_results',
+        'description' => 'Processes results from a completed batch job and applies grades.',
         'type'        => 'write',
         'ajax'        => true,
         'services' => [MOODLE_OFFICIAL_MOBILE_SERVICE],
