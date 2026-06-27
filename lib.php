@@ -263,6 +263,8 @@ function quiz_autograde_generate_grade($attempt, $contextid) {
     }
 
     $generatedcontent = $response->get_response_data()['generatedcontent'];
+    // phpcs:ignore moodle.Strings.ForbiddenStrings.Found -- Intentional removal of optional markdown JSON fence from AI output.
+    $generatedcontent = trim(str_replace("```json", "", $generatedcontent));
 
     // Parse result.
     $data = json_decode($generatedcontent);

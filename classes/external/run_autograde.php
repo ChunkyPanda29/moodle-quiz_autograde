@@ -92,7 +92,7 @@ class run_autograde extends external_api {
                 // Grade by LLM.
                 $data = quiz_autograde_generate_grade($attempt, $context->id);
                 $grade = max(0, min($attempt->maxmark, $data->grade));
-                $comment = $data->comment ?? 'No explanation provided.';
+                $comment = '[Graded by AI] ' . ($data->comment ?? 'No explanation provided.');
                 quiz_autograde_set_grade($attempt, $grade, $comment);
             }
 
