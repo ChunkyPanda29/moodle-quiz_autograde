@@ -357,7 +357,7 @@ EOD;
                 $results[$idx] = (object) [
                     'success' => true,
                     'grade' => max(0, min($maxmark, (float)$item->grade)),
-                    'comment' => $item->comment ?? get_string('noexplanation', 'quiz_autograde'),
+                    'comment' => '[Graded by AI] ' . ($item->comment ?? get_string('noexplanation', 'quiz_autograde')),
                     'error' => null,
                 ];
             }
@@ -500,7 +500,7 @@ function quiz_autograde_generate_grade($attempt, $contextid, $maxretries = QUIZ_
             return (object) [
                 'success' => true,
                 'grade' => $data->grade,
-                'comment' => $data->comment ?? get_string('noexplanation', 'quiz_autograde'),
+                'comment' => '[Graded by AI] ' . ($data->comment ?? get_string('noexplanation', 'quiz_autograde')),
                 'error' => null,
             ];
 
