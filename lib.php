@@ -214,9 +214,14 @@ function quiz_autograde_require_text_generation() {
 define('QUIZ_AUTOGRADE_DEFAULT_RETRIES', 1);
 
 /**
+ * Default number of retry attempts specifically for rate limit (429) errors.
+ */
+define('QUIZ_AUTOGRADE_RATE_LIMIT_RETRIES', 3);
+
+/**
  * Default delay in seconds between API calls to avoid rate limiting.
  */
-define('QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS', 3);
+define('QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS', 5);
 
 /**
  * Grades all student answers for a single question in one AI call.
@@ -283,6 +288,7 @@ Only return the JSON array. No additional text. Make sure the JSON is valid.
 EOD;
 
     $lasterror = '';
+    $rate_limit_retries = 0;
 
     for ($retry = 0; $retry <= QUIZ_AUTOGRADE_DEFAULT_RETRIES; $retry++) {
         if ($retry > 0) {
@@ -299,7 +305,16 @@ EOD;
                 $error = $response->get_errormessage();
                 $lasterror = "Error {$errorcode}: {$error}";
 
-                // Auth or server errors — retry. Rate limit — won't help, skip.
+                // Rate limit (429) — retry with exponential backoff.
+                if ($errorcode === 429 && $rate_limit_retries < QUIZ_AUTOGRADE_RATE_LIMIT_RETRIES) {
+                    $backoff = QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS * pow(2, $rate_limit_retries + 1);
+                    sleep((int)$backoff);
+                    $rate_limit_retries++;
+                    $retry--; // Don't consume a normal retry for rate limit.
+                    continue;
+                }
+
+                // Auth or server errors — retry.
                 if (!in_array($errorcode, [401, 403, 500, 503])) {
                     break;
                 }
@@ -427,6 +442,7 @@ function quiz_autograde_generate_grade($attempt, $contextid, $maxretries = QUIZ_
     EOD;
 
     $lasterror = '';
+    $rate_limit_retries = 0;
 
     for ($retry = 0; $retry <= $maxretries; $retry++) {
         // If retrying, add a short delay to let rate limits reset.
@@ -445,9 +461,16 @@ function quiz_autograde_generate_grade($attempt, $contextid, $maxretries = QUIZ_
                 $error = $response->get_errormessage();
                 $lasterror = "Error {$errorcode}: {$error}";
 
-                // If auth error (401/403), retry with fallback key.
-                // Rate limit (429) is per-project so retrying won't help.
-                // Server errors (500/503) may be transient, retry.
+                // Rate limit (429) — retry with exponential backoff.
+                if ($errorcode === 429 && $rate_limit_retries < QUIZ_AUTOGRADE_RATE_LIMIT_RETRIES) {
+                    $backoff = QUIZ_AUTOGRADE_DEFAULT_THROTTLE_SECONDS * pow(2, $rate_limit_retries + 1);
+                    sleep((int)$backoff);
+                    $rate_limit_retries++;
+                    $retry--; // Don't consume a normal retry for rate limit.
+                    continue;
+                }
+
+                // Auth or server errors — retry.
                 if (!in_array($errorcode, [401, 403, 500, 503])) {
                     return (object) [
                         'success' => false,
